@@ -1,0 +1,8 @@
+{
+  "installCommand": "exit 0",
+  "buildCommand": "exit 0",
+  "outputDirectory": "vercel-dashboard/public",
+  "rewrites": [
+    { "source": "/api/:path*", "destination": "http://82.153.118.72:4000/api/:path*" }
+  ]
+}

@@ -230,6 +230,329 @@ async function adminServers(main, ok) {
   paint();
 }
 
+// ----------------------------- Ban evidence (picker + ban dialog) -------------------------------
+// Files are checked / shrunk in the browser, then sent as base64 inside the ban request. The server
+// (api/server.js) re-checks them and forwards them to the user in their ban DM.
+const EVD_MAX_FILES = 5;
+const EVD_LIMIT = 3000000; // total bytes (the server allows 3 MiB; this leaves a little margin)
+const EVD_IMAGE_TARGET = 900000; // screenshots are shrunk to roughly this size each
+
+function evdInjectStyles() {
+  if (document.getElementById("evd-style")) return;
+  const style = document.createElement("style");
+  style.id = "evd-style";
+  style.textContent = `
+    .evd { margin-top: 14px; }
+    .evd-drop { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border: 1.5px dashed var(--border, rgba(255,255,255,.16)); border-radius: var(--radius-md, 14px); background: var(--surface-2, rgba(255,255,255,.02)); cursor: pointer; outline: none; transition: border-color .15s, background .15s; }
+    .evd-drop:hover, .evd-drop:focus-visible { border-color: var(--accent, #5865f2); }
+    .evd-drop.drag { border-color: var(--accent, #5865f2); background: var(--accent-soft, rgba(88,101,242,.14)); }
+    .evd-icon { flex: none; width: 38px; height: 38px; display: grid; place-items: center; border-radius: 10px; background: var(--accent-soft, rgba(88,101,242,.15)); color: var(--accent, #5865f2); }
+    .evd-title { font-size: 14px; font-weight: 700; color: var(--text, #eef0f6); }
+    .evd-title span { font-weight: 500; color: var(--text-dim, #9aa1b5); }
+    .evd-hint { margin-top: 2px; font-size: 12.5px; line-height: 1.45; color: var(--text-dim, #9aa1b5); }
+    .evd-hint b { color: var(--text, #eef0f6); font-weight: 600; }
+    .evd-list { display: grid; gap: 8px; margin-top: 10px; }
+    .evd-list:empty { display: none; }
+    .evd-item { display: flex; align-items: center; gap: 12px; padding: 8px 10px; border: 1px solid var(--border, rgba(255,255,255,.08)); border-radius: 12px; background: var(--surface-2, rgba(255,255,255,.03)); }
+    .evd-thumb { flex: none; width: 44px; height: 44px; border-radius: 8px; object-fit: cover; display: grid; place-items: center; background: rgba(255,255,255,.06); font-size: 11px; font-weight: 800; letter-spacing: .04em; color: var(--text-dim, #9aa1b5); }
+    .evd-info { min-width: 0; flex: 1; }
+    .evd-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; color: var(--text, #eef0f6); }
+    .evd-sub { margin-top: 1px; font-size: 12px; color: var(--text-faint, #6b7286); }
+    .evd-x { flex: none; width: 28px; height: 28px; border: 0; border-radius: 8px; background: transparent; color: var(--text-dim, #9aa1b5); font-size: 14px; cursor: pointer; }
+    .evd-x:hover { background: var(--danger-soft, rgba(237,66,69,.15)); color: #ff8183; }
+    .evd-busy { color: var(--text-dim, #9aa1b5); font-size: 13px; }
+    .evd-spin { flex: none; width: 18px; height: 18px; margin: 0 13px; border: 2px solid rgba(255,255,255,.15); border-top-color: var(--accent, #5865f2); border-radius: 50%; animation: evd-spin .7s linear infinite; }
+    @keyframes evd-spin { to { transform: rotate(360deg); } }
+    .evd-meta { margin-top: 8px; font-size: 12px; color: var(--text-faint, #6b7286); }
+    .evd-meta:empty { display: none; }
+    .evd-bar { height: 4px; margin-top: 6px; border-radius: 4px; background: rgba(255,255,255,.07); overflow: hidden; }
+    .evd-bar i { display: block; height: 100%; background: var(--accent, #5865f2); }
+    .evd-bar i.warn { background: var(--warning, #f5a623); }
+    .evd-modal-note { margin: -8px 0 16px; font-size: 13px; color: var(--text-dim, #9aa1b5); }
+  `;
+  document.head.appendChild(style);
+}
+
+const evdFmtSize = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1e3))} KB`);
+
+function evdKind(file) {
+  const type = (file.type || "").toLowerCase();
+  const name = (file.name || "").toLowerCase();
+  if (/^image\/(png|jpe?g|webp)$/.test(type)) return "image";
+  if (type === "image/gif") return "gif"; // kept as-is so animations survive
+  if (type === "application/pdf" || name.endsWith(".pdf")) return "pdf";
+  if (type.startsWith("text/") || /\.(txt|log)$/.test(name)) return "text";
+  return null;
+}
+
+function evdReadImage(file) {
+  return new Promise((resolve, reject) => {
+    const url = URL.createObjectURL(file);
+    const img = new Image();
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      resolve(img);
+    };
+    img.onerror = () => {
+      URL.revokeObjectURL(url);
+      reject(new Error(`Couldn\u2019t read \u201c${file.name}\u201d as an image.`));
+    };
+    img.src = url;
+  });
+}
+
+// Small images are kept untouched; big screenshots are scaled down and re-saved as JPEG until they're small enough.
+async function evdShrinkImage(file) {
+  const img = await evdReadImage(file);
+  const longest = Math.max(img.naturalWidth, img.naturalHeight);
+  if (file.size <= EVD_IMAGE_TARGET && longest <= 1600) return { blob: file, name: file.name };
+
+  let blob = null;
+  for (const [max, quality] of [[1600, 0.85], [1280, 0.72], [1024, 0.6], [800, 0.5]]) {
+    const scale = Math.min(1, max / longest);
+    const canvas = document.createElement("canvas");
+    canvas.width = Math.max(1, Math.round(img.naturalWidth * scale));
+    canvas.height = Math.max(1, Math.round(img.naturalHeight * scale));
+    const ctx = canvas.getContext("2d");
+    ctx.fillStyle = "#fff"; // JPEG has no transparency
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+    blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", quality));
+    if (blob && blob.size <= EVD_IMAGE_TARGET) break;
+  }
+  if (!blob) throw new Error(`Couldn\u2019t shrink \u201c${file.name}\u201d.`);
+  if (blob.size >= file.size && file.size <= EVD_LIMIT) return { blob: file, name: file.name }; // already smaller than our attempt
+  return { blob, name: file.name.replace(/\.[^.]+$/, "") + ".jpg" };
+}
+
+function evdToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+    reader.onerror = () => reject(new Error("Couldn\u2019t read one of the evidence files."));
+    reader.readAsDataURL(blob);
+  });
+}
+
+// Drop zone + file list. Works with click-to-browse, drag & drop and pasting screenshots (Ctrl+V).
+// scope = the element that listens for paste events (defaults to the picker itself).
+function createEvidencePicker(mount, { scope } = {}) {
+  evdInjectStyles();
+  let items = [];
+  let busy = 0;
+  let seq = 0;
+  let queue = Promise.resolve();
+
+  mount.innerHTML = `
+    <div class="evd">
+      <div class="evd-drop" tabindex="0" role="button" aria-label="Attach evidence files">
+        <div class="evd-icon"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.4 11.1l-9.2 9.2a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.5-8.5"/></svg></div>
+        <div>
+          <div class="evd-title">Attach evidence <span>(optional)</span></div>
+          <div class="evd-hint">Drop files here, <b>paste a screenshot</b> (Ctrl+V) or click to browse. Sent to the user in their ban DM.<br>Up to ${EVD_MAX_FILES} files, ${evdFmtSize(EVD_LIMIT)} in total \u00b7 images, PDF or text.</div>
+        </div>
+        <input type="file" multiple hidden accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain,.txt,.log,.pdf" />
+      </div>
+      <div class="evd-list"></div>
+      <div class="evd-meta"></div>
+    </div>`;
+
+  const drop = mount.querySelector(".evd-drop");
+  const input = mount.querySelector("input[type=file]");
+  const list = mount.querySelector(".evd-list");
+  const meta = mount.querySelector(".evd-meta");
+  const total = () => items.reduce((n, it) => n + it.size, 0);
+
+  function render() {
+    list.innerHTML = "";
+    for (const it of items) {
+      const row = document.createElement("div");
+      row.className = "evd-item";
+      const thumb = it.url
+        ? `<img class="evd-thumb" src="${it.url}" alt="" />`
+        : `<div class="evd-thumb">${it.kind === "pdf" ? "PDF" : "TXT"}</div>`;
+      row.innerHTML = `${thumb}<div class="evd-info"><div class="evd-name">${escapeHtml(it.name)}</div><div class="evd-sub">${evdFmtSize(it.size)}${it.note ? ` \u00b7 ${escapeHtml(it.note)}` : ""}</div></div><button type="button" class="evd-x" title="Remove" aria-label="Remove ${escapeHtml(it.name)}">\u2715</button>`;
+      row.querySelector(".evd-x").addEventListener("click", () => remove(it.id));
+      list.appendChild(row);
+    }
+    if (busy) list.insertAdjacentHTML("beforeend", `<div class="evd-item evd-busy"><div class="evd-spin"></div>Processing\u2026</div>`);
+
+    const used = total();
+    const pct = Math.min(100, Math.round((used / EVD_LIMIT) * 100));
+    meta.innerHTML =
+      items.length || busy
+        ? `${items.length} file${items.length === 1 ? "" : "s"} \u00b7 ${evdFmtSize(used)} of ${evdFmtSize(EVD_LIMIT)}<div class="evd-bar"><i class="${pct > 80 ? "warn" : ""}" style="width:${pct}%"></i></div>`
+        : "";
+  }
+
+  function remove(id) {
+    const i = items.findIndex((it) => it.id === id);
+    if (i < 0) return;
+    if (items[i].url) URL.revokeObjectURL(items[i].url);
+    items.splice(i, 1);
+    render();
+  }
+
+  function clear() {
+    items.forEach((it) => it.url && URL.revokeObjectURL(it.url));
+    items = [];
+    render();
+  }
+
+  // Files are processed one after another so the size limit is checked in order.
+  function addFiles(fileList) {
+    const files = Array.from(fileList || []);
+    if (!files.length) return;
+    queue = queue.then(async () => {
+      for (const file of files) {
+        if (items.length >= EVD_MAX_FILES) {
+          toast(`You can attach up to ${EVD_MAX_FILES} files.`, "error");
+          break;
+        }
+        const kind = evdKind(file);
+        if (!kind) {
+          toast(`\u201c${file.name}\u201d isn\u2019t supported. Attach images, PDFs or text files.`, "error");
+          continue;
+        }
+        busy++;
+        render();
+        try {
+          let blob = file;
+          let name = file.name || "evidence";
+          let note = "";
+          if (kind === "image") {
+            const shrunk = await evdShrinkImage(file);
+            blob = shrunk.blob;
+            name = shrunk.name;
+            if (blob !== file) note = "resized";
+          }
+          if (total() + blob.size > EVD_LIMIT) {
+            toast(`\u201c${file.name}\u201d doesn\u2019t fit: evidence is limited to ${evdFmtSize(EVD_LIMIT)} in total.`, "error");
+            continue;
+          }
+          items.push({ id: ++seq, name, kind, blob, size: blob.size, note, url: kind === "image" || kind === "gif" ? URL.createObjectURL(blob) : null });
+        } catch (err) {
+          toast(err.message || `Couldn\u2019t add \u201c${file.name}\u201d.`, "error");
+        } finally {
+          busy--;
+          render();
+        }
+      }
+    });
+  }
+
+  drop.addEventListener("click", () => input.click());
+  drop.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      input.click();
+    }
+  });
+  input.addEventListener("change", () => {
+    addFiles(input.files);
+    input.value = "";
+  });
+  ["dragenter", "dragover"].forEach((type) =>
+    drop.addEventListener(type, (e) => {
+      e.preventDefault();
+      drop.classList.add("drag");
+    })
+  );
+  ["dragleave", "drop"].forEach((type) =>
+    drop.addEventListener(type, (e) => {
+      e.preventDefault();
+      drop.classList.remove("drag");
+    })
+  );
+  drop.addEventListener("drop", (e) => addFiles(e.dataTransfer && e.dataTransfer.files));
+  (scope || mount).addEventListener("paste", (e) => {
+    const images = Array.from((e.clipboardData && e.clipboardData.files) || []).filter((f) => (f.type || "").startsWith("image/"));
+    if (!images.length) return; // plain text pastes behave normally
+    e.preventDefault();
+    addFiles(images);
+  });
+
+  return {
+    count: () => items.length,
+    clear,
+    // waits for anything still being processed, then returns [{ data: "<base64>" }, ...]
+    async getPayload() {
+      await queue;
+      return Promise.all(items.map(async (it) => ({ data: await evdToBase64(it.blob) })));
+    },
+  };
+}
+
+// Ban dialog used by the per-row "Ban" buttons (replaces the old browser prompt).
+// onSubmit({ reason, evidence }) must resolve true when the ban went through, false to keep the dialog open.
+function evdOpenBanModal({ id, name }, onSubmit) {
+  evdInjectStyles();
+  const backdrop = document.createElement("div");
+  backdrop.className = "modal-backdrop";
+  backdrop.innerHTML = `
+    <div class="modal">
+      <h2>Ban ${escapeHtml(name || id)}</h2>
+      <p class="evd-modal-note">They\u2019ll get a DM with the reason and any evidence you attach.</p>
+      <div class="field">
+        <label>Reason <span class="hint" style="display:inline">(optional)</span></label>
+        <input type="text" class="evd-reason" maxlength="200" placeholder="Shown to the user in their ban DM" />
+      </div>
+      <div class="field">
+        <label>Evidence</label>
+        <div class="evd-mount"></div>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="btn btn-ghost evd-cancel">Cancel</button>
+        <button type="button" class="btn btn-danger evd-confirm">Ban user</button>
+      </div>
+    </div>`;
+  document.body.appendChild(backdrop);
+
+  const reasonEl = backdrop.querySelector(".evd-reason");
+  const confirmBtn = backdrop.querySelector(".evd-confirm");
+  const cancelBtn = backdrop.querySelector(".evd-cancel");
+  const picker = createEvidencePicker(backdrop.querySelector(".evd-mount"), { scope: backdrop.querySelector(".modal") });
+  let submitting = false;
+
+  const onKey = (e) => {
+    if (e.key === "Escape" && !submitting) close();
+  };
+  function close() {
+    picker.clear();
+    document.removeEventListener("keydown", onKey);
+    backdrop.remove();
+  }
+  document.addEventListener("keydown", onKey);
+  cancelBtn.addEventListener("click", () => !submitting && close());
+  backdrop.addEventListener("mousedown", (e) => {
+    if (e.target === backdrop && !submitting) close();
+  });
+  reasonEl.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") confirmBtn.click();
+  });
+
+  confirmBtn.addEventListener("click", async () => {
+    if (submitting) return;
+    submitting = true;
+    confirmBtn.disabled = cancelBtn.disabled = true;
+    const label = confirmBtn.textContent;
+    confirmBtn.textContent = "Banning\u2026";
+    try {
+      const evidence = await picker.getPayload();
+      if (await onSubmit({ reason: reasonEl.value.trim(), evidence })) return close();
+    } catch (err) {
+      toast(err.message, "error");
+    } finally {
+      submitting = false;
+      if (backdrop.isConnected) {
+        confirmBtn.disabled = cancelBtn.disabled = false;
+        confirmBtn.textContent = label;
+      }
+    }
+  });
+  reasonEl.focus();
+}
+
 // ----------------------------- Users & bans -------------------------------
 async function adminUsers(main, ok) {
   let data = await api("/api/admin/users");
@@ -237,7 +560,7 @@ async function adminUsers(main, ok) {
   let q = "";
 
   main.innerHTML = `
-    <div class="page-header adm-head"><div><h1>Users &amp; bans</h1><p>Banned users can\u2019t log in to the dashboard or use the bot in Discord.</p></div></div>
+    <div class="page-header adm-head"><div><h1>Users &amp; bans</h1><p>Banned users can\u2019t log in to the dashboard or use the bot in Discord. They\u2019re sent a DM with the reason and any evidence you attach.</p></div></div>
     <div class="card">
       <div class="card-title"><h2>Ban a user</h2><span class="muted">Right-click a user in Discord \u2192 Copy User ID (needs Developer Mode)</span></div>
       <div class="ban-form">
@@ -245,6 +568,7 @@ async function adminUsers(main, ok) {
         <input type="text" id="ban-reason" maxlength="200" placeholder="Reason (optional \u2014 shown to the user)" />
         <button class="btn btn-danger" id="ban-go">Ban user</button>
       </div>
+      <div id="ban-evd"></div>
     </div>
     <div class="card" id="ban-list"></div>
     <div class="card">
@@ -268,11 +592,29 @@ async function adminUsers(main, ok) {
       toast(err.message, "error");
     }
   };
-  const doBan = (id, name) => {
-    const reason = prompt(`Ban ${name || id}?\n\nReason (optional \u2014 the user will see it):`);
-    if (reason === null) return;
-    act(() => api("/api/admin/bans", { method: "POST", body: { userId: id, reason } }), `Banned ${name || id}`);
+  const evidencePicker = createEvidencePicker(document.getElementById("ban-evd"), {
+    scope: document.getElementById("ban-evd").parentElement,
+  });
+
+  // Sends the ban (with any evidence) and reports how the DM to the user went. Returns true when the ban went through.
+  const submitBan = async (id, label, reason, evidence) => {
+    try {
+      const res = await api("/api/admin/bans", { method: "POST", body: { userId: id, reason, evidence } });
+      toast(`Banned ${label}`);
+      const dm = res && res.dm;
+      if (dm && dm.sent) toast(`DM sent${dm.files ? ` with ${dm.files} evidence file${dm.files === 1 ? "" : "s"}` : ""}.`);
+      else if (dm) toast(`Couldn\u2019t DM ${label}: ${dm.error || "Discord wouldn\u2019t deliver the message."}`, "error");
+    } catch (err) {
+      toast(err.message, "error");
+      return false;
+    }
+    try {
+      await reload();
+    } catch {}
+    return true;
   };
+
+  const doBan = (id, name) => evdOpenBanModal({ id, name }, ({ reason, evidence }) => submitBan(id, name || id, reason, evidence));
   const doUnban = (id, name) => {
     if (!confirm(`Unban ${name || id}?`)) return;
     act(() => api(`/api/admin/bans/${id}`, { method: "DELETE" }), `Unbanned ${name || id}`);
@@ -323,15 +665,29 @@ async function adminUsers(main, ok) {
     document.querySelectorAll("[data-u-unban]").forEach((btn) => btn.addEventListener("click", () => doUnban(btn.dataset.uUnban, byId(btn.dataset.uUnban)?.username)));
   }
 
-  document.getElementById("ban-go").addEventListener("click", () => {
+  document.getElementById("ban-go").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
     const idEl = document.getElementById("ban-id");
     const reasonEl = document.getElementById("ban-reason");
     const id = idEl.value.trim();
     if (!/^\d{17,20}$/.test(id)) return toast("Enter a valid Discord user ID (17\u201320 digits).", "error");
-    act(() => api("/api/admin/bans", { method: "POST", body: { userId: id, reason: reasonEl.value.trim() } }), `Banned ${id}`).then(() => {
-      idEl.value = "";
-      reasonEl.value = "";
-    });
+
+    const label = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = evidencePicker.count() ? "Uploading\u2026" : "Banning\u2026";
+    try {
+      const evidence = await evidencePicker.getPayload();
+      if (await submitBan(id, id, reasonEl.value.trim(), evidence)) {
+        idEl.value = "";
+        reasonEl.value = "";
+        evidencePicker.clear();
+      }
+    } catch (err) {
+      toast(err.message, "error");
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
+    }
   });
   document.getElementById("u-q").addEventListener("input", (e) => {
     q = e.target.value;
